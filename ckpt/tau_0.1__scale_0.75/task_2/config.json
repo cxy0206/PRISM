@@ -1,0 +1,16 @@
+{
+  "exp_name": "tau=0.1,scale=0.75,task_2",
+  "timestamp": "2025-08-29 14:16:57",
+  "num_epochs": 100,
+  "lr": 5e-05,
+  "weight_decay": 0.0001,
+  "patience": 50,
+  "batch_size": 512,
+  "tau": 0.1,
+  "tau_phys": null,
+  "tau_phys_scale": 0.75,
+  "property_index": 2,
+  "hidden_dim": 512,
+  "dropout_rate": 0.1,
+  "cov_num": 3
+}
