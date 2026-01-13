@@ -106,10 +106,10 @@ EMB_DIM = 512
 
 # per-dataset training hyperparams (edit if you want)
 DATASET_PARAMS = {
-    "sider":  {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "clintox":{"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "tox21":  {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "muv":    {"batch_size": 32, "epochs": 250, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "sider":  {"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "clintox":{"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "tox21":  {"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "muv":    {"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
 }
 
 # spaces
@@ -124,7 +124,7 @@ DROP_ONE_SUBSETS = [
 
 # Selection stage settings
 SEARCH_FREEZE_ENCODERS = True         # freeze encoders during ckpt config selection (recommended)
-SEARCH_EPOCHS_CAP = 80                # max epochs during selection (early stop still applies)
+SEARCH_EPOCHS_CAP = 1               # max epochs during selection (early stop still applies)
 SEARCH_FUSION_KIND = "static"         # selection uses static fusion
 SEARCH_SUBSET = ALL4                  # selection uses all4 spaces
 SEARCH_SINGLE_RUN = True              # selection uses only 1 run (seed=42) for speed
@@ -1029,23 +1029,44 @@ def baseline_mpn_global_multitask(
     """
     set_seed(seed)
     tr_loader, vl_loader, te_loader = loaders
-    # rebuild data_list from existing dataset
-    def rebuild_loader(old_loader):
+
+    def rebuild_loader(old_loader, shuffle: bool):
         old_ds = old_loader.dataset
+        data_iter = getattr(old_ds, "_data", None)
+        if data_iter is None:
+            data_iter = [old_ds[i] for i in range(len(old_ds))]
+
+        # 空集直接返回一个不shuffle的loader（且batch_size=1也行）
+        if len(data_iter) == 0:
+            return GeoDataLoader(
+                MoleculeListDataset([]),
+                batch_size=1,
+                shuffle=False
+            )
+
         new_list = []
-        for g in old_ds._data:
+        for g in data_iter:
             smi = getattr(g, "smiles", None)
             x = calc_vsa_fp(smi) if smi is not None else None
             if x is None:
                 x = np.zeros((GLOBAL_DIM,), dtype=np.float32)
-            gg = g
-            gg.global_features = torch.tensor(x, dtype=torch.float32).view(1, -1)  # [1,2084]
-            new_list.append(gg)
-        return GeoDataLoader(MoleculeListDataset(new_list), batch_size=old_loader.batch_size, shuffle=old_loader.shuffle)
 
-    tr2 = rebuild_loader(tr_loader)
-    vl2 = rebuild_loader(vl_loader)
-    te2 = rebuild_loader(te_loader)
+            g.global_features = torch.tensor(x, dtype=torch.float32).view(1, -1)
+            new_list.append(g)
+
+        return GeoDataLoader(
+            MoleculeListDataset(new_list),
+            batch_size=old_loader.batch_size,
+            shuffle=shuffle,   # ✅ 显式传入
+            num_workers=getattr(old_loader, "num_workers", 0),
+            pin_memory=getattr(old_loader, "pin_memory", False),
+            drop_last=False,
+        )
+
+
+    tr2 = rebuild_loader(tr_loader, shuffle=True)
+    vl2 = rebuild_loader(vl_loader, shuffle=False)
+    te2 = rebuild_loader(te_loader, shuffle=False)
 
     sample = tr2.dataset[0]
     atom_fdim = sample.x.shape[1]
