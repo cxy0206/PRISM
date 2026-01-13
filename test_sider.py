@@ -80,16 +80,14 @@ except Exception as e:
 # =========================================================
 # Global config
 # =========================================================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", device)
-
+device = '0'
 DATA_DIR = "data"
 CKPT_ROOT = "ckpt"
 
-OUT_ROOT = "results_aug_new/multitask_cls_suite"
+OUT_ROOT = "results_aug_new/sider"
 os.makedirs(OUT_ROOT, exist_ok=True)
 
-DATASETS = ["sider", "clintox", "tox21", "muv"]
+DATASETS = ["sider"]
 
 # fixed split seed (same split used for all runs)
 SPLIT_SEED = 42
@@ -107,9 +105,6 @@ EMB_DIM = 512
 # per-dataset training hyperparams 
 DATASET_PARAMS = {
     "sider":  {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "clintox":{"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "tox21":  {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "muv":    {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
 }
 
 # spaces
