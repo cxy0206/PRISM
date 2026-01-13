@@ -104,12 +104,12 @@ PATIENCE_LR = 10
 LR_FACTOR = 0.5
 EMB_DIM = 512
 
-# per-dataset training hyperparams (edit if you want)
+# per-dataset training hyperparams 
 DATASET_PARAMS = {
-    "sider":  {"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "clintox":{"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "tox21":  {"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
-    "muv":    {"batch_size": 32, "epochs": 1, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "sider":  {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "clintox":{"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "tox21":  {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
+    "muv":    {"batch_size": 32, "epochs": 200, "dropout": 0.1, "weight_decay": 1e-5, "val_split": 0.1, "test_split": 0.1},
 }
 
 # spaces
@@ -124,7 +124,7 @@ DROP_ONE_SUBSETS = [
 
 # Selection stage settings
 SEARCH_FREEZE_ENCODERS = True         # freeze encoders during ckpt config selection (recommended)
-SEARCH_EPOCHS_CAP = 1               # max epochs during selection (early stop still applies)
+SEARCH_EPOCHS_CAP = 200               # max epochs during selection (early stop still applies)
 SEARCH_FUSION_KIND = "static"         # selection uses static fusion
 SEARCH_SUBSET = ALL4                  # selection uses all4 spaces
 SEARCH_SINGLE_RUN = True              # selection uses only 1 run (seed=42) for speed
@@ -1057,7 +1057,7 @@ def baseline_mpn_global_multitask(
         return GeoDataLoader(
             MoleculeListDataset(new_list),
             batch_size=old_loader.batch_size,
-            shuffle=shuffle,   # ✅ 显式传入
+            shuffle=shuffle,  
             num_workers=getattr(old_loader, "num_workers", 0),
             pin_memory=getattr(old_loader, "pin_memory", False),
             drop_last=False,
