@@ -238,6 +238,7 @@ class BMixSolvationPredictor(nn.Module):
 
         # 4) Scalar residual
         lambda_cross = torch.exp(self.cross_scale)
+        lambda_alpha = torch.exp(self.cross_scale * (1 - 2 * torch.abs(ratio_batch - 0.5)))
         dy = lambda_cross * M.sum(dim=(-2, -1), keepdim=True)
         dy = dy.view(dy.size(0), 1)
 
