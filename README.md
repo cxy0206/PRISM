@@ -17,9 +17,8 @@ The graph encoder follows a MPNN-style message passing architecture adapted from
 ```text
 PRISM/
   chemprop/           # Lightweight Chemprop/CMPNN components
-  data/               # Single-molecule datasets, e.g., MoleculeNet-style CSVs
+  data/               # Molecule datasets, e.g., MoleculeNet-style CSVs
   model/              # PRISM encoders, fusion heads, and losses
-  pair_data/          # Solute–solvent–temperature solubility datasets
 
   pretrain.py         # Prior-alignment pre-training
   finetune_single.py  # Single-molecule fine-tuning
