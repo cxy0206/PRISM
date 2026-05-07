@@ -8,7 +8,7 @@ The framework contains three main stages:
 2. **Prior-alignment pre-training**: align molecular graph embeddings with prior-defined similarity geometries.
 3. **Downstream fine-tuning**: evaluate the learned representations on single-molecule prediction and solute–solvent–temperature solubility regression.
 
-The graph encoder follows a CMPNN-style message passing architecture adapted from Chemprop.
+The graph encoder follows a MPNN-style message passing architecture adapted from Chemprop.
 
 ---
 
