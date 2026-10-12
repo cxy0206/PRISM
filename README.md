@@ -43,10 +43,10 @@ conda create -n prism python=3.11
 conda activate prism
 
 python -m pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu118
-python -m pip install -r requriements.txt --extra-index-url https://download.pytorch.org/whl/cu118
+python -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu118
 ```
 
-The CUDA wheel command follows the [PyTorch installation instructions for version 2.4.0](https://pytorch.org/get-started/previous-versions/#v240). The spelling `requriements.txt` above matches the file currently included in this repository.
+The CUDA wheel command follows the [PyTorch installation instructions for version 2.4.0](https://pytorch.org/get-started/previous-versions/#v240). T
 
 The local `chemprop/` directory is part of the implementation; installing a separate Chemprop release does not replace it.
 

@@ -80,10 +80,6 @@ The training script reads:
 
 Additional columns are `solute`, `solvent1`, and `solvent2` (names), and `s` (the corresponding non-logarithmic solubility value). They are not used as prediction inputs.
 
-In the supplied file, all 26,730 records satisfy `logS = log10(s)` and `Xsolvent1 + Xsolvent2 = 1` to numerical precision. Temperature ranges from 252.55 to 368.15 K. The mixed-solvent loader normalizes the two composition values to sum to one by default and uses the existing `logS` column without applying another logarithm.
-
-**Solubility-scale note:** The numerical relationship `logS = log10(s)` establishes the logarithm base, but does not establish a physical concentration unit. The supplied CSV does not carry unit metadata for `s`. Retain the supplied scale for these experiments; do not assume it is mol/L or combine these targets with the pure-solvent targets without checking the original conversion. The Bao et al. publication reports a g/100 g convention, which must be traced through preprocessing before assigning that unit to this particular processed column.
-
 ## Data splits and evaluation
 
 The CSV files contain observations rather than fixed split assignments. The current entry points handle splitting as follows:
