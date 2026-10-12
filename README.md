@@ -11,8 +11,6 @@ This repository contains entry points for:
 - Pure-solvent solubility prediction using solute, solvent, and temperature inputs.
 - Mixed-solvent solubility prediction using solute, solvent identities, composition, and temperature.
 
-**Pretrained weights are not distributed.** The training workflow uses checkpoints generated locally by the pretraining scripts.
-
 
 ## Repository structure
 
@@ -31,8 +29,6 @@ PRISM/
 ├── requriements.txt          # Existing dependency-file name
 └── README.md
 ```
-
-Run commands from the repository root. The examples use Bash syntax; in PowerShell, put each command on one line or replace the Bash continuation character `\` with a PowerShell backtick.
 
 ## Environment setup
 
