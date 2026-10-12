@@ -1,41 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Single-run pretraining script for ChemSpace-style GNN encoder.
+"""PRISM prior-specific relational pretraining.
 
-Main features:
-- Read a CSV file with a `smiles` column.
-- For each SMILES, compute three VSA descriptor vectors:
-    * SMR_VSA1-10
-    * SlogP_VSA1-10
-    * PEOE_VSA1-14
-- Convert (SMILES, VSA vectors) into graph data via `smiles2graph`.
-- Filter out empty graphs (no nodes or edges).
-- Train a single GNNModelWithNewLoss instance with a simple train/val split.
-- Log tau_phys statistics at each epoch via a runtime monkey-patch:
-    * Wrap `_soft_labels_from_distance` to record tau_phys.
-    * Expose `begin_epoch()` / `end_epoch_stats()` hooks on the model.
-- Save artifacts into `save_dir`:
-    * config.json
-    * history.csv
-    * tau_phys_epoch.csv
-    * best_model.pth
-    * training_curve.png
-
-This script is intended as a minimal, reproducible pretraining entry point
-for research code (e.g., for publication and open-sourcing on GitHub).
-
-python pretrain_single.py \
-  --data_csv ./data/zinc_smiles.csv \
-  --save_dir mpnn_pretrain/zinc_single \
-  --num_epochs 200 \
-  --property_index none \
-  --tau 0.1 \
-  --tau_phys_scale 0.5
-
+Train one encoder per VSA or fingerprint prior. Global molecular features are
+optional and disabled by default. Checkpoints contain the encoder configuration.
 """
 
 import os
+import random
 import json
 import csv
 import time
@@ -185,20 +157,20 @@ def enable_tau_logging(model):
     Enable per-epoch tau_phys statistics logging on the given model instance.
 
     This function assumes the model class defines a method:
-        _soft_labels_from_distance(self, D, *args, **kwargs)
+        _soft_targets_from_distance(self, D, *args, **kwargs)
     which returns a tuple (Y, tau_val), where tau_val is a scalar tensor
     (or a Python float) representing the physical temperature parameter.
 
     At runtime, we:
-      1. Wrap `_soft_labels_from_distance` to record all tau_val values
+      1. Wrap `_soft_targets_from_distance` to record all tau_val values
          into `model._epoch_tau_phys_samples`.
       2. Attach two helper hooks to the instance:
            - model.begin_epoch()
            - model.end_epoch_stats()
          which respectively reset and summarize the collected tau_phys values.
     """
-    if not hasattr(model.__class__, "_soft_labels_from_distance"):
-        print("[warn] model class has no _soft_labels_from_distance; "
+    if not hasattr(model.__class__, "_soft_targets_from_distance"):
+        print("[warn] model class has no _soft_targets_from_distance; "
               "tau_phys logging disabled.")
         return
 
@@ -206,9 +178,9 @@ def enable_tau_logging(model):
     model._tau_phys_epoch_stats = []
 
     # Unbound original method from the class, so we can re-bind it with extra logic
-    orig_unbound = model.__class__._soft_labels_from_distance
+    orig_unbound = model.__class__._soft_targets_from_distance
 
-    def _wrapped_soft_labels_from_distance(self, D, *args, **kwargs):
+    def _wrapped_soft_targets_from_distance(self, D, *args, **kwargs):
         """
         Wrapper that forwards to the original method and records tau_phys
         for each call during the current epoch.
@@ -223,7 +195,7 @@ def enable_tau_logging(model):
         return Y, tau_val
 
     # Bind wrapper to the instance
-    model._soft_labels_from_distance = MethodType(_wrapped_soft_labels_from_distance, model)
+    model._soft_targets_from_distance = MethodType(_wrapped_soft_targets_from_distance, model)
 
     def _begin_epoch(self):
         """Reset tau_phys samples at the beginning of each epoch."""
@@ -274,6 +246,7 @@ def train_with_list_batches(
     batch_size: int = 128,
     best_val_loss_all: float = float("inf"),
     exp_name: Optional[str] = None,
+    seed: int = 42,
 ) -> float:
     """
     Train a single model instance on a (train, val) split of the given data list.
@@ -321,6 +294,8 @@ def train_with_list_batches(
     # Persist one-off config (includes tau & tau_phys_scale if present)
     config = {
         "exp_name": exp_name or "",
+        "seed": seed,
+        "encoder_config": model.encoder_config(),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "num_epochs": num_epochs,
         "lr": lr,
@@ -343,12 +318,20 @@ def train_with_list_batches(
     # Dataset & loaders
     ds = FilterEmptyGraphs(data_list)
     n_train = int(0.8 * len(ds))
-    train_set, val_set = random_split(ds, [n_train, len(ds) - n_train])
+    if n_train < 2 or len(ds) - n_train < 2:
+        raise ValueError("Pretraining needs at least two graphs in both train and validation sets.")
+    train_set, val_set = random_split(
+        ds, [n_train, len(ds) - n_train], generator=torch.Generator().manual_seed(seed)
+    )
+    split_rows = [(i, "train") for i in train_set.indices] + [(i, "val") for i in val_set.indices]
+    pd.DataFrame([
+        {"graph_index": i, "smiles": ds[i].smiles, "split": split} for i, split in split_rows
+    ]).sort_values("graph_index").to_csv(os.path.join(save_path, "split.csv"), index=False)
 
     # Keep the structure as list[Data]; let the model handle batching
     collate = lambda xs: xs
     train_loader = TorchDataLoader(
-        train_set, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate
+        train_set, batch_size=batch_size, shuffle=True, drop_last=False, collate_fn=collate
     )
     val_loader = TorchDataLoader(
         val_set, batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate
@@ -392,7 +375,9 @@ def train_with_list_batches(
             total_loss += float(loss.detach())
             steps += 1
 
-        avg_train_loss = total_loss / max(steps, 1)
+        if steps == 0:
+            raise RuntimeError("No valid pretraining updates; check batches and loss values.")
+        avg_train_loss = total_loss / steps
         train_losses.append(avg_train_loss)
 
         # --------- validation phase ---------
@@ -404,7 +389,9 @@ def train_with_list_batches(
                 if torch.isfinite(l):
                     val_loss += float(l.item())
                     vsteps += 1
-        avg_val_loss = val_loss / max(vsteps, 1)
+        if vsteps == 0:
+            raise RuntimeError("No finite validation losses.")
+        avg_val_loss = val_loss / vsteps
         val_losses.append(avg_val_loss)
         scheduler.step(avg_val_loss)
         lr_now = optimizer.param_groups[0]["lr"]
@@ -447,6 +434,8 @@ def train_with_list_batches(
             patience_counter = 0
             torch.save(
                 {
+                    "format_version": 2,
+                    "encoder_config": model.encoder_config(),
                     "encoder_state_dict": model.state_dict(),
                     "config": config,
                     "best_val_loss": best_val_loss,
@@ -517,6 +506,7 @@ def build_model(
     tau: float,
     tau_phys_scale: float,
     save_path: str,
+    atom_messages: bool = True,
 ):
     """
     Construct a fresh GNNModelWithNewLoss instance and attach tau-related
@@ -530,6 +520,7 @@ def build_model(
         cov_num=cov_num,
         dropout_rate=dropout_rate,
         property_index=property_index,  # 0, 1, 2, or None
+        atom_messages=atom_messages,
         save_path=save_path,
     )
 
@@ -555,12 +546,12 @@ def parse_args() -> argparse.Namespace:
     Parse command-line arguments for the pretraining script.
     """
     parser = argparse.ArgumentParser(
-        description="Single-run pretraining script for ChemSpace-style GNN encoder."
+        description="Single-run pretraining script for PRISM-style GNN encoder."
     )
     parser.add_argument(
         "--data_csv",
         type=str,
-        default="./data/vsa_zinc_25k.csv",
+        default="data/zinc15_250K.csv",
         help="Path to the input CSV file (must contain 'smiles' column).",
     )
     parser.add_argument(
@@ -644,11 +635,19 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional experiment name stored in config.json.",
     )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--use_global_features", action="store_true", help="Opt in to global descriptor inputs; disabled by default.")
+    parser.add_argument("--message_type", choices=["atom", "bond"], default="atom")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
     # Map property_index argument to an integer or None
     if args.property_index.lower() in ["none", "-1"]:
@@ -663,7 +662,7 @@ def main():
     example = data_list[0]
     atom_dim = example.x.shape[1]
     bond_dim = example.edge_attr.shape[1] if getattr(example, "edge_attr", None) is not None else 0
-    num_global_features = getattr(example, "global_features", torch.zeros(1, 0)).shape[1]
+    num_global_features = int(example.global_features.shape[1]) if args.use_global_features else 0
 
     print(f"[info] atom_dim={atom_dim}, bond_dim={bond_dim}, "
           f"num_global_features={num_global_features}")
@@ -680,7 +679,8 @@ def main():
         tau=args.tau,
         tau_phys_scale=args.tau_phys_scale,
         save_path=args.save_dir,
-    )
+        atom_messages=args.message_type == "atom",
+    ).to(torch.device(args.device))
 
     # 4) Train the model
     train_kwargs = dict(
@@ -691,6 +691,7 @@ def main():
         batch_size=args.batch_size,
         best_val_loss_all=float("inf"),  # single run
         exp_name=args.exp_name,
+        seed=args.seed,
     )
 
     best_val_loss = train_with_list_batches(

@@ -63,7 +63,7 @@ def get_global_features(mol):
     except Exception as e:
         print(f"Error calculating descriptors for molecule: {e}")
         # Return zeros array with expected length if calculation fails
-        return np.zeros(10, dtype=np.float32)
+        return np.zeros(8, dtype=np.float32)
     
 def calculate_vsa_vectors(smiles, vsa_type='smr'):
     """Compute SMR_VSA1-10, SlogP_VSA1-10, PEOE_VSA1-14 vectors and return as numpy array."""
@@ -121,8 +121,7 @@ def smiles2graph(x_smiles, atom_featurizer=get_multi_hot_atom_featurizer('V1'), 
     for smiles, label, prop in zip(x_smiles, y, properties):
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
-            print(f"[Warning] Failed to parse SMILES: {smiles}")
-            continue
+            raise ValueError(f"Invalid SMILES: {smiles!r}. Clean complete CSV rows before graph construction.")
         graph = mol2graph(mol, atom_featurizer, bond_featurizer)
         graph.smiles = smiles
 

@@ -1,71 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Pairwise solvation regression fine-tuning (solute + solvent + temperature).
+"""PRISM pure-solvent solubility fine-tuning.
 
-Task
-----
-Given:
-    - solute SMILES
-    - solvent SMILES
-    - temperature (K)
-predict:
-    - logS (solubility, e.g., in log10 scale)
-
-Model
------
-- Multiple pre-trained ChemSpace encoders (e.g., task_0 / task_1 / task_2 / task_none)
-  are loaded from checkpoint files.
-- For both solute and solvent, we:
-    * encode with each encoder,
-    * fuse encoder outputs with a WeightedFusion module.
-- A small MLP (TempPairMLP) combines:
-    * fused solute embedding
-    * fused solvent embedding
-    * embedded temperature
-  to produce a scalar prediction.
-
-Data format
------------
-Training CSV (and test CSVs) are expected to contain at least:
-    - solute_smiles
-    - solvent_smiles
-    - temperature  (or 't')
-    - logS         (or 'logs')
-
-Column names are resolved in a case-insensitive way with simple fallbacks.
-
-Metrics
--------
-For each run (seed) and dataset:
-    - MSE  (Mean Squared Error)
-    - pct(|pred - logS| <= 1.0)   # coverage within ±1 log unit
-
-Across seeds, the script reports mean ± std for:
-    - validation MSE
-    - per-test-dataset MSE
-    - per-test-dataset pct(|pred-logS| <= 1)
-
-Typical usage
--------------
-Example:
-
-    python finetune_pair_solvation.py \\
-        --train_csv datasets/bigsoldb_chemprop_nonaq.csv \\
-        --test_csvs datasets/leeds_all_chemprop.csv,\\
-                    datasets/solprop_chemprop_nonaq.csv \\
-        --encoder_ckpts "ckpt/tau_0.1__scale_0.25/task_0/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.25/task_1/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.25/task_2/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.25/task_none/best_model.pth" \\
-        --space_indices 0,1,2 \\
-        --seeds 42,43,44 \\
-        --batch_size 64 --val_ratio 0.05 --epochs 200 --weight_decay 1e-5 \\
-        --solute_dropout 0.3 --solvent_dropout 0.3 --mlp_hidden 1024,128,64 \\
-        --mlp_dropout 0.2 --t_embed_dim 32 \\
-        --learning_rate 1e-4 --emb_dim 512 \\
-        --patience_es 50 --patience_lr 30 --lr_factor 0.5 \\
-        --out_dir results/solvation_pair_finetune
+Split the supplied BigSolDB training CSV by canonical solute into training and
+validation sets. Evaluate Leeds and SolProp through separate external test CSVs.
+Save each seed's split, model configuration, and best-validation checkpoint.
+The checkpoint can initialize the fusion modules in mixed-solvent training.
+Report MSE, RMSE, and the fraction of predictions within one log unit.
 """
 
 import os
@@ -81,13 +22,13 @@ import torch.optim as optim
 
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch
-from rdkit import Chem  # kept for future extensions
-from sklearn.model_selection import train_test_split
+from rdkit import Chem
+from sklearn.model_selection import GroupShuffleSplit
 
 # ---------- external project modules ----------
 from model.getdata import smiles2graph
-from model.mpn_vas_st import GNNModelWithNewLoss
-from model.fusion import WeightedFusion
+from model.fusion import make_fusion
+from model.checkpoints import load_encoders, encoder_output_dim
 
 # -------------------------------------------------------------------------
 # Device
@@ -271,62 +212,31 @@ def collate_pair(batch):
     return b1, b2, temps, labels
 
 
-def data_builder(
-    d1,
-    d2,
-    y,
-    T,
-    batch_size: int = 64,
-    seed: int = 42,
-    val_ratio: float = 0.05,
-    test_ratio: float = 1e-6,
-):
-    """
-    Split the dataset (on the training CSV) into train / val / test
-    using random splits, then build DataLoaders.
-
-    In this script we only use the train and val loaders; the small test
-    split is kept for compatibility with the original ablation code.
-
-    Parameters
-    ----------
-    d1, d2 : list of Data
-        Solute and solvent graphs.
-    y : np.ndarray
-        Labels.
-    T : np.ndarray
-        Temperatures.
-    batch_size : int
-    seed : int
-    val_ratio : float
-    test_ratio : float
-
-    Returns
-    -------
-    train_loader, val_loader, test_loader : DataLoader
-    """
-    idx = list(range(len(y)))
-    train_idx, test_idx = train_test_split(idx, test_size=test_ratio, random_state=seed)
-    train_idx, val_idx = train_test_split(
-        train_idx,
-        test_size=val_ratio / max(1e-8, (1 - test_ratio)),
-        random_state=seed,
-    )
-
-    def sub(lst, ids):
-        return [lst[i] for i in ids]
-
-    ds_tr = PairDataset(sub(d1, train_idx), sub(d2, train_idx),
-                        sub(T, train_idx), sub(y, train_idx))
-    ds_va = PairDataset(sub(d1, val_idx), sub(d2, val_idx),
-                        sub(T, val_idx), sub(y, val_idx))
-    ds_te = PairDataset(sub(d1, test_idx), sub(d2, test_idx),
-                        sub(T, test_idx), sub(y, test_idx))
-
-    tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, collate_fn=collate_pair)
-    va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, collate_fn=collate_pair)
-    te = DataLoader(ds_te, batch_size=batch_size, shuffle=False, collate_fn=collate_pair)
-    return tr, va, te
+def data_builder(d1, d2, y, T, batch_size=64, seed=42, val_ratio=0.05, split_path=None):
+    """Split BigSolDB into solute-disjoint train/validation sets. Tests are external."""
+    if not (len(d1) == len(d2) == len(y) == len(T)):
+        raise ValueError("Graph, target, and temperature rows are not aligned.")
+    groups = []
+    for graph in d1:
+        mol = Chem.MolFromSmiles(graph.smiles)
+        if mol is None:
+            raise ValueError(f"Invalid solute SMILES: {graph.smiles!r}")
+        groups.append(Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True))
+    if len(set(groups)) < 2:
+        raise ValueError("At least two distinct solutes are needed for train/validation splitting.")
+    splitter = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
+    train_idx, val_idx = next(splitter.split(np.arange(len(y)), groups=groups))
+    if split_path:
+        ensure_dir(os.path.dirname(split_path) or ".")
+        split = np.full(len(y), "train", dtype=object)
+        split[val_idx] = "val"
+        pd.DataFrame({"row_index": np.arange(len(y)), "canonical_solute": groups,
+                      "split": split}).to_csv(split_path, index=False)
+    def loader(ids, shuffle):
+        subset = lambda values: [values[i] for i in ids]
+        dataset = PairDataset(subset(d1), subset(d2), subset(T), subset(y))
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_pair)
+    return loader(train_idx, True), loader(val_idx, False)
 
 
 def make_full_test_loader(csv_path: str, batch_size: int = 64) -> DataLoader:
@@ -351,40 +261,9 @@ def make_full_test_loader(csv_path: str, batch_size: int = 64) -> DataLoader:
 
 # ================== encoder loading ==================
 
-def load_pretrained_encoders(sample, ckpt_paths: List[str]):
-    """
-    Load a list of pre-trained ChemSpace encoders from checkpoint paths.
-
-    Parameters
-    ----------
-    sample : Data
-        A sample graph used to infer node / edge feature dimensions.
-    ckpt_paths : list of str
-        Paths to encoder checkpoints.
-
-    Returns
-    -------
-    encs : list of GNNModelWithNewLoss
-        Encoder modules.
-    """
-    encs = []
-    for path in ckpt_paths:
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Encoder checkpoint not found: {path}")
-
-        model = GNNModelWithNewLoss(
-            num_node_features=sample.x.shape[1],
-            num_edge_features=sample.edge_attr.shape[1],
-            num_global_features=0,
-            cov_num=3,
-            hidden_dim=EMB_DIM,
-        ).to(device)
-
-        ck = torch.load(path, map_location=device)
-        state = ck.get("encoder_state_dict", ck)
-        model.load_state_dict(state, strict=True)
-        encs.append(model)
-    return encs
+def load_pretrained_encoders(sample, ckpt_paths, use_global_features=False, target_device=None):
+    return load_encoders(sample, ckpt_paths, target_device or device,
+                         allow_global_features=use_global_features)
 
 
 # ================== model definition ==================
@@ -491,68 +370,23 @@ class SolvationPredictor(nn.Module):
         return pred, z1, z2
 
 
-def build_model_subset(
-    sample_s,
-    sample_v,
-    ckpt_paths: List[str],
-    solute_dropout: float,
-    solvent_dropout: float,
-    mlp_hidden: Tuple[int, ...],
-    mlp_dropout: float,
-    t_embed_dim: int,
-) -> SolvationPredictor:
-    """
-    Build a SolvationPredictor using a subset of pre-trained encoders.
-
-    Parameters
-    ----------
-    sample_s, sample_v : Data
-        Example solute and solvent graphs used to infer feature sizes.
-    ckpt_paths : list of str
-        Paths to encoder checkpoints (one per ChemSpace task).
-    solute_dropout, solvent_dropout : float
-        Dropout rates for solute / solvent fusion modules.
-    mlp_hidden : tuple of int
-        Hidden layer sizes for TempPairMLP.
-    mlp_dropout : float
-        Dropout rate in TempPairMLP.
-    t_embed_dim : int
-        Temperature embedding dimension.
-
-    Returns
-    -------
-    SolvationPredictor
-    """
-    sol_encs = load_pretrained_encoders(sample_s, ckpt_paths)
-    solv_encs = load_pretrained_encoders(sample_v, ckpt_paths)
-
-    sol_f = WeightedFusion(len(ckpt_paths), EMB_DIM, dropout=solute_dropout, pair=True).to(device)
-    solv_f = WeightedFusion(len(ckpt_paths), EMB_DIM, dropout=solvent_dropout, pair=True).to(device)
-
-    # Probe the fused embedding dimension
-    with torch.no_grad():
-        b1 = Batch.from_data_list([sample_s]).to(device)
-        b2 = Batch.from_data_list([sample_v]).to(device)
-        z1 = _stack_encode(sol_encs, b1)
-        z2 = _stack_encode(solv_encs, b2)
-        g1 = getattr(b1, "global_features", None)
-        g2 = getattr(b2, "global_features", None)
-        z1 = sol_f(z1, g1)
-        z2 = solv_f(z2, g2)
-        if isinstance(z1, tuple):
-            z1 = z1[0]
-        if isinstance(z2, tuple):
-            z2 = z2[0]
-        z_dim = z1.shape[-1]
-
-    comb = TempPairMLP(
-        z_dim,
-        t_embed_dim=t_embed_dim,
-        hidden=mlp_hidden,
-        dropout=mlp_dropout,
-    ).to(device)
-
-    return SolvationPredictor(sol_encs, solv_encs, sol_f, solv_f, comb).to(device)
+def build_model_subset(sample_s, sample_v, ckpt_paths, solute_dropout, solvent_dropout,
+                       mlp_hidden, mlp_dropout, t_embed_dim, fusion_type="adaptive",
+                       use_global_features=False):
+    sol_encs = load_pretrained_encoders(sample_s, ckpt_paths, use_global_features)
+    solv_encs = load_pretrained_encoders(sample_v, ckpt_paths, use_global_features)
+    z_dim = encoder_output_dim(sol_encs)
+    if z_dim != encoder_output_dim(solv_encs):
+        raise ValueError("Solute and solvent encoder dimensions differ.")
+    sol_f = make_fusion(len(ckpt_paths), z_dim, dropout=solute_dropout, pair=True,
+                        fusion_type=fusion_type, use_global_features=use_global_features).to(device)
+    solv_f = make_fusion(len(ckpt_paths), z_dim, dropout=solvent_dropout, pair=True,
+                         fusion_type=fusion_type, use_global_features=use_global_features).to(device)
+    comb = TempPairMLP(z_dim, t_embed_dim=t_embed_dim, hidden=mlp_hidden, dropout=mlp_dropout).to(device)
+    model = SolvationPredictor(sol_encs, solv_encs, sol_f, solv_f, comb).to(device)
+    model.fusion_type = fusion_type
+    model.use_global_features = use_global_features
+    return model
 
 
 # ================== training & testing ==================
@@ -646,7 +480,7 @@ def train_one(
 
         if val_rmse + 1e-8 < best:
             best = val_rmse
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience = 0
         else:
             patience += 1
@@ -770,7 +604,7 @@ def parse_args():
         "--val_ratio",
         type=float,
         default=0.05,
-        help="Validation ratio on the training CSV (random split).",
+        help="Fraction of canonical solute groups reserved for validation; test datasets are external.",
     )
     parser.add_argument(
         "--epochs",
@@ -826,7 +660,7 @@ def parse_args():
         "--emb_dim",
         type=int,
         default=512,
-        help="Embedding dimension for each encoder (default: 512).",
+        help="Legacy argument; actual width is read from encoder checkpoints.",
     )
     parser.add_argument(
         "--patience_es",
@@ -861,6 +695,8 @@ def parse_args():
         help="Optional experiment name used as a tag in output files.",
     )
 
+    parser.add_argument("--use_global_features", action="store_true")
+    parser.add_argument("--fusion_type", choices=["static", "adaptive"], default="adaptive")
     return parser.parse_args()
 
 
@@ -935,7 +771,9 @@ def main():
 
         # Build train / val from training CSV
         d1, d2, y, T = _smiles_graph_inputs_from_csv(args.train_csv)
-        tr_loader, va_loader, _ = data_builder(
+        run_dir = os.path.join(args.out_dir, f"seed{seed}")
+        ensure_dir(run_dir)
+        tr_loader, va_loader = data_builder(
             d1,
             d2,
             y,
@@ -943,7 +781,7 @@ def main():
             batch_size=args.batch_size,
             seed=seed,
             val_ratio=args.val_ratio,
-            test_ratio=1e-6,  # effectively no test split on the training CSV
+            split_path=os.path.join(run_dir, "split.csv"),
         )
 
         if len(tr_loader.dataset) == 0:
@@ -962,6 +800,8 @@ def main():
             mlp_hidden=tuple(int(x) for x in args.mlp_hidden.split(",") if x.strip()),
             mlp_dropout=args.mlp_dropout,
             t_embed_dim=args.t_embed_dim,
+            fusion_type=args.fusion_type,
+            use_global_features=args.use_global_features,
         )
 
         # Train
@@ -973,6 +813,18 @@ def main():
             weight_decay=args.weight_decay,
             prefix=f"[subset={subset_name}|seed={seed}] ",
         )
+        torch.save({
+            "format_version": 2,
+            "model_state_dict": model.state_dict(),
+            "fusion_type": model.fusion_type,
+            "use_global_features": model.use_global_features,
+            "encoder_configs": [enc.encoder_config() for enc in model.sol_encs],
+            "encoder_ckpts": ckpt_paths_subset,
+            "config": vars(args),
+            "seed": seed,
+            "best_val_rmse": best_val_rmse,
+        }, os.path.join(run_dir, "model_best.pth"))
+        save_json(vars(args), os.path.join(run_dir, "config.json"))
         val_rmse_list.append(best_val_rmse)
         print(f"[Seed {seed}] best_val_RMSE={best_val_rmse:.4f}")
 
@@ -997,6 +849,7 @@ def main():
                     "test_dataset": alias,
                     "val_rmse": best_val_rmse,
                     "test_mse": mse_val,
+                    "test_rmse": float(np.sqrt(mse_val)),
                     "test_pct1": pct1,
                 }
             )
@@ -1034,8 +887,8 @@ def main():
             "test_dataset": "val",
             "subset": subset_name,
             "num_encoders": len(subset_indices),
-            "mse_mean": val_mean**2,  # Note: val_mean is RMSE; store MSE here for completeness
-            "mse_std": None,
+            "mse_mean": float(np.square(val_rmse_list).mean()),
+            "mse_std": float(np.square(val_rmse_list).std(ddof=0)),
             "rmse_mean": val_mean,
             "rmse_std": val_std,
             "pct1_mean": None,
@@ -1054,8 +907,8 @@ def main():
                 "num_encoders": len(subset_indices),
                 "mse_mean": float(mse_arr.mean()),
                 "mse_std": float(mse_arr.std()),
-                "rmse_mean": float(np.sqrt(mse_arr.mean())),
-                "rmse_std": None,  # can be derived if needed
+                "rmse_mean": float(np.sqrt(mse_arr).mean()),
+                "rmse_std": float(np.sqrt(mse_arr).std(ddof=0)),
                 "pct1_mean": float(pct_arr.mean()),
                 "pct1_std": float(pct_arr.std()),
             }

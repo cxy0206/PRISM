@@ -8,7 +8,7 @@ import torch.nn as nn
 from chemprop.nn_utils import index_select_ND, get_activation_function
 
 # =========================
-# New: PyG list -> simple batched "mol-graph" adapter
+# PyG list to batched molecular-graph adapter
 # =========================
 
 class SimpleBatchGraph:
@@ -70,8 +70,8 @@ class SimpleBatchGraph:
             a2b_local = [[] for _ in range(Na)]
             a2a_local = [[] for _ in range(Na)]
             for lb, (u,v) in enumerate(pairs):
-                a2b_local[u].append(lb)
-                a2a_local[u].append(v)
+                a2b_local[v].append(lb)
+                a2a_local[v].append(u)
 
             # 特征先原样缓存，稍后统一在前面加 dummy 行
             atom_feats.append(x.cpu())
@@ -90,10 +90,10 @@ class SimpleBatchGraph:
             # b2a / b2revb 也使用 1-based
             # 注意：这里先临时存，循环外再一次性 tensor 化
             if mol_idx == 0:
-                b2a_list = []
-                b2revb_list = []
+                b2a_list = [0]
+                b2revb_list = [0]
             for lb, (u,v) in enumerate(pairs):
-                b2a_list.append(atom_offset + v)                 # 1-based
+                b2a_list.append(atom_offset + u)                 # 1-based
                 rev_local = pair_to_local.get((v,u), lb)
                 b2revb_list.append(bond_offset + rev_local)      # 1-based
 
@@ -153,7 +153,7 @@ def to_mol_graph(batch, args: Namespace, prompt: bool):
         return batch
 
     if isinstance(batch, (list, tuple)) and len(batch) > 0 and hasattr(batch[0], "x") and hasattr(batch[0], "edge_index"):
-        # Infer device from first Data.x (kept on CPU; MPNEncoder will .cuda() as in your current code)
+        # Construct graph indices on CPU; the encoder selects its execution device.
         atom_fdim = args.atom_fdim if hasattr(args, "atom_fdim") and args.atom_fdim is not None else None
         bond_fdim = args.bond_fdim if hasattr(args, "bond_fdim") and args.bond_fdim is not None else None
         return SimpleBatchGraph(
@@ -168,7 +168,7 @@ def to_mol_graph(batch, args: Namespace, prompt: bool):
 
 
 # =========================
-# MPN & Encoder (unchanged core math; only minor robustness tweaks)
+# Message-passing network and encoder
 # =========================
 
 class MPNEncoder(nn.Module):
@@ -219,12 +219,15 @@ class MPNEncoder(nn.Module):
         Returns:
             Tensor of shape (num_molecules, hidden_size), i.e., per-molecule embeddings.
         """
-        # Unpack components (CPU), then move to GPU (keeping your original .cuda() behavior)
+        # Move graph tensors to the model device.
         f_atoms, f_bonds, a2b, b2a, b2revb, a_scope, b_scope, _ = mol_graph.get_components()
-        f_atoms, f_bonds, a2b, b2a, b2revb = f_atoms.cuda(), f_bonds.cuda(), a2b.cuda(), b2a.cuda(), b2revb.cuda()
+        device = self.W_i.weight.device
+        f_atoms, f_bonds, a2b, b2a, b2revb = (
+            tensor.to(device) for tensor in (f_atoms, f_bonds, a2b, b2a, b2revb)
+        )
 
         if self.atom_messages:
-            a2a = mol_graph.get_a2a().cuda()
+            a2a = mol_graph.get_a2a().to(device)
 
         # Input
         if self.atom_messages:
@@ -232,6 +235,11 @@ class MPNEncoder(nn.Module):
         else:
             input = self.W_i(f_bonds)  # num_bonds x hidden_size
         message = self.act_func(input)  # [N_atom or N_bond] x hidden_size
+
+        # The padding state remains zero even when linear layers have biases.
+        valid_message = (torch.arange(message.size(0), device=device) != 0).unsqueeze(1)
+        input = input * valid_message
+        message = message * valid_message
 
         # Message passing
         for _ in range(self.depth - 1):
@@ -251,6 +259,7 @@ class MPNEncoder(nn.Module):
             message = self.W_h(message)
             message = self.act_func(input + message)
             message = self.dropout_layer(message)
+            message = message * valid_message
 
         a2x = a2a if self.atom_messages else a2b
         nei_a_message = index_select_ND(message, a2x)  # [num_atoms, max_deg, hidden]

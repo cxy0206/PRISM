@@ -26,11 +26,14 @@ class StaticWeightedFusion(nn.Module):
         global_dim=32,
         global_in_dim=8,
         pair=False,
+        use_global_features=False,
     ):
         super().__init__()
         self.num_inputs = num_inputs
         self.emb_dim = emb_dim
         self.pair = pair
+        self.use_global_features = bool(use_global_features)
+        global_dim = global_dim if self.use_global_features else 0
 
         self.branch_proj = nn.Sequential(
             nn.Linear(emb_dim, emb_dim),
@@ -44,7 +47,7 @@ class StaticWeightedFusion(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(emb_dim) if layer_norm_out else None
 
-        self.global_encoder = nn.Linear(global_in_dim, global_dim)
+        self.global_encoder = nn.Linear(global_in_dim, global_dim) if self.use_global_features else None
 
         self.mlp = nn.Sequential(
             nn.Linear(emb_dim + global_dim, 1024),
@@ -60,6 +63,8 @@ class StaticWeightedFusion(nn.Module):
         )
 
     def _encode_global(self, global_features, B, device):
+        if self.global_encoder is None:
+            return torch.empty(B, 0, device=device)
         if global_features is None:
             global_features = torch.zeros(
                 B,
@@ -138,13 +143,16 @@ class AdaptiveWeightedFusion(nn.Module):
         global_in_dim=8,
         use_global_in_weights=True,
         pair=False,
+        use_global_features=False,
         temperature_init=1.0,
     ):
         super().__init__()
         self.num_inputs = num_inputs
         self.emb_dim = emb_dim
         self.pair = pair
-        self.use_global_in_weights = use_global_in_weights
+        self.use_global_features = bool(use_global_features)
+        global_dim = global_dim if self.use_global_features else 0
+        self.use_global_in_weights = use_global_in_weights and self.use_global_features
 
         self.branch_proj = nn.Sequential(
             nn.Linear(emb_dim, emb_dim),
@@ -152,9 +160,9 @@ class AdaptiveWeightedFusion(nn.Module):
             nn.Linear(emb_dim, emb_dim),
         )
 
-        self.global_encoder = nn.Linear(global_in_dim, global_dim)
+        self.global_encoder = nn.Linear(global_in_dim, global_dim) if self.use_global_features else None
 
-        gate_in_dim = emb_dim + (global_dim if use_global_in_weights else 0)
+        gate_in_dim = emb_dim + (global_dim if self.use_global_in_weights else 0)
         self.weight_net = nn.Sequential(
             nn.Linear(gate_in_dim, max(128, emb_dim // 2)),
             nn.ReLU(),
@@ -183,6 +191,8 @@ class AdaptiveWeightedFusion(nn.Module):
         )
 
     def _encode_global(self, global_features, B, device):
+        if self.global_encoder is None:
+            return torch.empty(B, 0, device=device)
         if global_features is None:
             global_features = torch.zeros(
                 B,
@@ -247,7 +257,7 @@ class AdaptiveWeightedFusion(nn.Module):
 
 class FusionFineTuneModel(nn.Module):
     """
-    Fine-tuning wrapper for ChemSpaceA / PRISM branch encoders.
+    Fine-tuning wrapper for PRISM branch encoders.
 
     fusion_type:
         - "static": sample-independent global branch weights
@@ -281,3 +291,12 @@ class FusionFineTuneModel(nn.Module):
 
 WeightedFusion = StaticWeightedFusion
 WeightedFusion_new = AdaptiveWeightedFusion
+
+def make_fusion(num_inputs, emb_dim, dropout=0.1, pair=False,
+                fusion_type="adaptive", use_global_features=False):
+    classes = {"static": StaticWeightedFusion, "adaptive": AdaptiveWeightedFusion}
+    if fusion_type not in classes:
+        raise ValueError(f"Unsupported fusion type: {fusion_type}")
+    return classes[fusion_type](num_inputs=num_inputs, emb_dim=emb_dim,
+                               dropout=dropout, pair=pair,
+                               use_global_features=use_global_features)

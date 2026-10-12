@@ -1,63 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Single-task fine-tuning script for multi-space ChemSpace encoders (WeightedFusion).
+"""PRISM single-molecule fine-tuning.
 
-Key features
-------------
-- Supports both classification and regression downstream tasks.
-- Uses multiple pre-trained ChemSpace encoders (e.g., task_0 / task_1 / task_2 / task_none).
-- Applies a WeightedFusion module to combine encoder outputs.
-- Fine-tunes a small head on top of frozen encoders using a Murcko-scaffold split.
-- Reports:
-    * For classification: ROC-AUC mean ± std over multiple runs (seeds).
-    * For regression: RMSE mean ± std over multiple runs (seeds).
-- Saves per-run training curves (loss + val metric) and summary CSV files.
-
-Typical usage
--------------
-Example (classification, binary task):
-
-    python finetune_single.py \\
-        --task_type classification \\
-        --data_csv data/bbbp.csv \\
-        --label_col bbbp \\
-        --encoder_ckpts "ckpt/tau_0.1__scale_0.25/task_0/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.25/task_1/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.25/task_2/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.25/task_none/best_model.pth" \\
-        --space_indices 0,1,2,3 \\
-        --dropout 0.1 --weight_decay 0.0 --batch_size 64 \\
-        --epochs 200 --val_split 0.1 --test_split 0.1 --seed 42 --runs 3
-
-Example (regression):
-
-    python finetune_single.py \\
-        --task_type regression \\
-        --data_csv data/esol.csv \\
-        --label_col esol \\
-        --encoder_ckpts "ckpt/tau_0.1__scale_0.75/task_0/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.75/task_1/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.75/task_2/best_model.pth,\\
-                         ckpt/tau_0.1__scale_0.75/task_none/best_model.pth" \\
-        --space_indices 0,1,2,3 \\
-        --dropout 0.3 --weight_decay 1e-5 --batch_size 64 \\
-        --epochs 200 --val_split 0.1 --test_split 0.1 --seed 42 --runs 3
-
-Hyperparameters that can be overridden from CLI
------------------------------------------------
-- learning_rate  (default: 1e-4)
-- emb_dim        (default: 512)
-- patience_es    (default: 20)
-- patience_lr    (default: 10)
-- lr_factor      (default: 0.5)
-
-Notes
------
-- The indices given by --space_indices refer to positions in the encoder_ckpts list.
-  For example, with 4 encoders, "0,2,3" will use encoders 0, 2, and 3.
-- The script assumes that `smiles2graph`, `GNNModelWithNewLoss`, and
-  `WeightedFusion` + `FusionFineTuneModel` are available in `model/`.
+Train the encoders and fusion module on scaffold-split classification or
+regression tasks. Default fusion is static for classification and adaptive for
+regression. Encoder dimensions are restored from checkpoint configurations;
+global molecular features require explicit opt-in.
 """
 
 import os
@@ -98,8 +46,8 @@ LR_FACTOR = 0.5       # default LR decay factor
 # Project-specific imports
 # -------------------------------------------------------------------------
 from model.getdata import smiles2graph
-from model.mpn_vas_st import GNNModelWithNewLoss
-from model.fusion import WeightedFusion as WeightedFusion, FusionFineTuneModel
+from model.fusion import make_fusion, FusionFineTuneModel
+from model.checkpoints import load_encoders, encoder_output_dim
 
 
 # -------------------------------------------------------------------------
@@ -277,77 +225,16 @@ def load_data(
 # -------------------------------------------------------------------------
 # Encoder & fusion model construction
 # -------------------------------------------------------------------------
-def load_pretrained_encoders(sample, ckpt_paths: List[str]):
-    """
-    Load multiple pre-trained GNN encoders from checkpoint paths.
-
-    Parameters
-    ----------
-    sample : torch_geometric.data.Data
-        A sample graph object used only to infer the required feature dimensions.
-    ckpt_paths : list of str
-        Paths to encoder checkpoint files. Each checkpoint is expected to store
-        either:
-            - a dict with key 'encoder_state_dict', or
-            - a state_dict directly.
-
-    Returns
-    -------
-    encoders : list of nn.Module
-        List of encoder instances, each moved to the current device.
-    """
-    encoders = []
-    num_node_features = sample.x.shape[1]
-    num_edge_features = sample.edge_attr.shape[1]
-
-    for path in ckpt_paths:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Encoder checkpoint not found: {path}")
-
-        enc = GNNModelWithNewLoss(
-            num_node_features=num_node_features,
-            num_edge_features=num_edge_features,
-            num_global_features=0,
-            cov_num=3,
-            hidden_dim=EMB_DIM,
-        ).to(device)
-
-        ckpt = torch.load(path, map_location=device)
-        state = ckpt.get("encoder_state_dict", ckpt)
-        enc.load_state_dict(state, strict=True)
-        encoders.append(enc)
-
-    return encoders
+def load_pretrained_encoders(sample, ckpt_paths, use_global_features=False):
+    return load_encoders(sample, ckpt_paths, device, allow_global_features=use_global_features)
 
 
-def get_finetune_model(sample, dropout: float, ckpt_paths: List[str]):
-    """
-    Build the fine-tuning model composed of:
-        - a list of frozen encoders, and
-        - a WeightedFusion head.
-
-    Parameters
-    ----------
-    sample : Data
-        Example graph used to infer feature sizes for the encoders.
-    dropout : float
-        Dropout rate for the fusion module.
-    ckpt_paths : list of str
-        Paths to the pre-trained encoders that will be fused.
-
-    Returns
-    -------
-    model : FusionFineTuneModel
-        Full fine-tuning model with `.encoders` and `.fusion`.
-    """
-    encoders = load_pretrained_encoders(sample, ckpt_paths)
-    fusion = WeightedFusion(
-        num_inputs=len(ckpt_paths),
-        emb_dim=EMB_DIM,
-        dropout=dropout,
-    ).to(device)
-    model = FusionFineTuneModel(encoders, fusion, fusion_method="weighted").to(device)
-    return model
+def get_finetune_model(sample, dropout, ckpt_paths, fusion_type="static", use_global_features=False):
+    """Build a trainable PRISM encoder ensemble and its prediction head."""
+    encoders = load_pretrained_encoders(sample, ckpt_paths, use_global_features)
+    fusion = make_fusion(len(encoders), encoder_output_dim(encoders), dropout=dropout,
+                         fusion_type=fusion_type, use_global_features=use_global_features).to(device)
+    return FusionFineTuneModel(encoders, fusion, fusion_type=fusion_type).to(device)
 
 
 # -------------------------------------------------------------------------
@@ -483,7 +370,7 @@ def train_and_validate_classification(
 
         if auc > best_val_auc:
             best_val_auc = auc
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience_cnt = 0
         else:
             patience_cnt += 1
@@ -618,7 +505,7 @@ def train_and_validate_regression(
 
         if mse_val + 1e-8 < best_val_mse:
             best_val_mse = mse_val
-            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             patience_cnt = 0
         else:
             patience_cnt += 1
@@ -713,7 +600,7 @@ def plot_training_curve(
 # -------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Single-task fine-tuning for ChemSpace multi-encoder fusion (WeightedFusion)."
+        description="Single-task fine-tuning for PRISM multi-encoder fusion (WeightedFusion)."
     )
 
     # Task / data configuration
@@ -818,7 +705,7 @@ def parse_args():
         "--emb_dim",
         type=int,
         default=512,
-        help="Embedding dimension of each encoder (default: 512).",
+        help="Legacy argument; actual width is read from encoder checkpoints.",
     )
     parser.add_argument(
         "--patience_es",
@@ -853,6 +740,9 @@ def parse_args():
         help="Optional experiment name (used only for logging / filenames).",
     )
 
+    parser.add_argument("--use_global_features", action="store_true")
+    parser.add_argument("--fusion_type", choices=["auto", "static", "adaptive"], default="auto",
+                        help="auto uses static fusion for classification and adaptive fusion for regression.")
     return parser.parse_args()
 
 
@@ -935,7 +825,11 @@ def main():
         sample = train_loader.dataset[0]
 
         # Build the fine-tuning model (encoders + fusion head)
-        model = get_finetune_model(sample, dropout=args.dropout, ckpt_paths=ckpt_paths_subset)
+        fusion_type = args.fusion_type
+        if fusion_type == "auto":
+            fusion_type = "static" if args.task_type == "classification" else "adaptive"
+        model = get_finetune_model(sample, dropout=args.dropout, ckpt_paths=ckpt_paths_subset,
+                                   fusion_type=fusion_type, use_global_features=args.use_global_features)
 
         # Train & validate
         if args.task_type == "classification":

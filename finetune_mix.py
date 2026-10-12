@@ -1,33 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-ChemSpaceA / PRISM mixed-solvent fine-tuning.
+"""PRISM mixed-solvent fine-tuning.
 
-This script implements the mixed-solvent setting used in the updated paper
-framework:
-
-    frozen prior-aligned ChemSpaceA encoders
-        + trainable prior-specific fusion modules
-        + composition-weighted solvent pooling
-        + a lightweight solute-environment-temperature regression head
-
-The old BMix cross-attention / solvent-solvent residual matrix is intentionally
-removed from the main model. In the paper, the mixed-solvent experiment is used
-as a probe of whether frozen PRISM/ChemSpaceA representations already contain
-composition-relevant solvent information. Therefore the main model should be
-simple and directly aligned with the method description.
-
-Expected mixed-solvent CSV columns by default:
-    solute_smiles, solvent1_smiles, solvent2_smiles,
-    Xsolvent1, Xsolvent2, temperature, logS
-
-Column names can be overridden with command-line arguments.
-
-Project assumptions:
-- model.getdata.smiles2graph exists.
-- finetune_pair.load_pretrained_encoders, finetune_pair._stack_encode,
-  and finetune_pair.TempPairMLP exist.
-- model.fusion.WeightedFusion_new exists.
+Prior-specific encoders feed trainable fusion modules, followed by
+composition-weighted solvent pooling and temperature-dependent regression.
+Encoders are frozen by default. Optional pure-solvent warm starts transfer only
+the fusion modules. CSV column names can be configured through the CLI.
 """
 
 from __future__ import annotations
@@ -50,7 +28,8 @@ from torch_geometric.data import Batch
 
 from model.getdata import smiles2graph
 from finetune_pair import TempPairMLP, _stack_encode, load_pretrained_encoders
-from model.fusion import WeightedFusion_new as WeightedFusion
+from model.fusion import make_fusion
+from model.checkpoints import encoder_output_dim
 
 
 # ============================================================
@@ -494,11 +473,11 @@ def get_sample_graphs_from_loader(loader: DataLoader):
 
 
 # ============================================================
-# Model: updated paper framework
+# PRISM mixed-solvent model
 # ============================================================
 
 
-class ChemSpaceAMixPredictor(nn.Module):
+class PRISMMixPredictor(nn.Module):
     """Composition-weighted mixed-solvent predictor.
 
     For a solute m and two solvents v1, v2 with mole fractions x1, x2:
@@ -509,9 +488,7 @@ class ChemSpaceAMixPredictor(nn.Module):
         z_env    = x1 * z_v1 + x2 * z_v2
         y_hat    = TempPairMLP(z_m, z_env, T)
 
-    This is the main model described in the updated paper: no cross-attention,
-    no solvent-solvent residual matrix, and no task-specific molecular encoder
-    update when --freeze_encoders is enabled.
+    The molecular encoders remain frozen when --freeze_encoders is enabled.
     """
 
     def __init__(
@@ -528,6 +505,14 @@ class ChemSpaceAMixPredictor(nn.Module):
         self.solute_fusion = solute_fusion
         self.solvent_fusion = solvent_fusion
         self.combiner = combiner
+        self.freeze_encoders = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_encoders:
+            for encoder in list(self.solute_encs) + list(self.solvent_encs):
+                encoder.eval()
+        return self
 
     @staticmethod
     def _fuse(fusion: nn.Module, embeddings: torch.Tensor, global_features: Optional[torch.Tensor]):
@@ -593,59 +578,27 @@ def make_ckpt_paths_from_pretrain(pretrain_base_dir: str, task_dirs: Sequence[st
 
 
 def build_mix_model(
-    sample_solute_graph: Any,
-    sample_solvent_graph: Any,
-    encoder_ckpts: Sequence[str],
-    emb_dim: int,
-    solute_dropout: float,
-    solvent_dropout: float,
-    mlp_hidden: Tuple[int, ...],
-    mlp_dropout: float,
-    t_embed_dim: int,
-    device: torch.device,
-) -> ChemSpaceAMixPredictor:
-    solute_encs = load_pretrained_encoders(sample_solute_graph, list(encoder_ckpts))
-    solvent_encs = load_pretrained_encoders(sample_solvent_graph, list(encoder_ckpts))
-
-    solute_fusion = WeightedFusion(len(encoder_ckpts), emb_dim, dropout=solute_dropout, pair=True).to(device)
-    solvent_fusion = WeightedFusion(len(encoder_ckpts), emb_dim, dropout=solvent_dropout, pair=True).to(device)
-
-    # Probe fused dimensionality because some encoders/fusion modules may change z_dim.
-    with torch.no_grad():
-        b_sol = Batch.from_data_list([sample_solute_graph]).to(device)
-        b_solv = Batch.from_data_list([sample_solvent_graph]).to(device)
-
-        z_sol_spaces = _stack_encode(solute_encs, b_sol)
-        z_solv_spaces = _stack_encode(solvent_encs, b_solv)
-
-        z_sol = ChemSpaceAMixPredictor._fuse(
-            solute_fusion,
-            z_sol_spaces,
-            getattr(b_sol, "global_features", None),
-        )
-        z_solv = ChemSpaceAMixPredictor._fuse(
-            solvent_fusion,
-            z_solv_spaces,
-            getattr(b_solv, "global_features", None),
-        )
-        if z_sol.shape[-1] != z_solv.shape[-1]:
-            raise RuntimeError(f"Solute dim {z_sol.shape[-1]} != solvent dim {z_solv.shape[-1]}")
-        z_dim = int(z_sol.shape[-1])
-
-    combiner = TempPairMLP(
-        z_dim,
-        t_embed_dim=t_embed_dim,
-        hidden=mlp_hidden,
-        dropout=mlp_dropout,
-    ).to(device)
-
-    return ChemSpaceAMixPredictor(
-        solute_encs=solute_encs,
-        solvent_encs=solvent_encs,
-        solute_fusion=solute_fusion,
-        solvent_fusion=solvent_fusion,
-        combiner=combiner,
-    ).to(device)
+    sample_solute_graph, sample_solvent_graph, encoder_ckpts, emb_dim,
+    solute_dropout, solvent_dropout, mlp_hidden, mlp_dropout, t_embed_dim,
+    device, fusion_type="adaptive", use_global_features=False,
+):
+    """Rebuild the encoder architecture from its saved configuration."""
+    solute_encs = load_pretrained_encoders(
+        sample_solute_graph, list(encoder_ckpts), use_global_features, device)
+    solvent_encs = load_pretrained_encoders(
+        sample_solvent_graph, list(encoder_ckpts), use_global_features, device)
+    emb_dim = encoder_output_dim(solute_encs)
+    solute_fusion = make_fusion(len(encoder_ckpts), emb_dim, solute_dropout,
+                              True, fusion_type, use_global_features)
+    solvent_fusion = make_fusion(len(encoder_ckpts), emb_dim, solvent_dropout,
+                               True, fusion_type, use_global_features)
+    combiner = TempPairMLP(emb_dim, t_embed_dim=t_embed_dim,
+                          hidden=mlp_hidden, dropout=mlp_dropout)
+    model = PRISMMixPredictor(solute_encs, solvent_encs, solute_fusion,
+                             solvent_fusion, combiner).to(device)
+    model.fusion_type = fusion_type
+    model.use_global_features = use_global_features
+    return model
 
 
 def _remap_state_dict_keys_for_mix_model(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -654,7 +607,7 @@ def _remap_state_dict_keys_for_mix_model(state: Dict[str, torch.Tensor]) -> Dict
     New main model names:
         solute_encs.*, solvent_encs.*, solute_fusion.*, solvent_fusion.*, combiner.*
 
-    Old BMix names:
+    Pure-solvent PRISM parameter names:
         sol_encs.*, solv_encs.*, sol_f.*, solv_f.*, combine.*
     """
     remapped: Dict[str, torch.Tensor] = {}
@@ -671,7 +624,7 @@ def _remap_state_dict_keys_for_mix_model(state: Dict[str, torch.Tensor]) -> Dict
         elif key.startswith("combine."):
             new_key = key.replace("combine", "combiner", 1)
 
-        # Drop old BMix-only modules if present.
+        # Ignore modules unrelated to fusion transfer in legacy checkpoints.
         if new_key.startswith(("attends.", "cross_scale", "space_head_s1.", "space_head_s2.")):
             continue
         remapped[new_key] = value
@@ -679,65 +632,47 @@ def _remap_state_dict_keys_for_mix_model(state: Dict[str, torch.Tensor]) -> Dict
 
 
 def load_checkpoint_into_mix_model(
-    model: ChemSpaceAMixPredictor,
-    ckpt_path: Optional[str],
-    device: torch.device,
-    freeze_encoders: bool = True,
-    freeze_fusions: bool = False,
-    freeze_combiner: bool = False,
-) -> ChemSpaceAMixPredictor:
+    model, ckpt_path, device, freeze_encoders=True,
+    freeze_fusions=False, freeze_combiner=False,
+):
+    """Warm-start only the two fusion modules from pure-solvent training."""
     if ckpt_path:
-        if not os.path.isfile(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device)
-        state = ckpt.get("model_state_dict", ckpt)
-        state = _remap_state_dict_keys_for_mix_model(state)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+        for name in ("fusion_type", "use_global_features"):
+            if name in checkpoint and checkpoint[name] != getattr(model, name):
+                raise ValueError(f"Warm-start {name} mismatch: {checkpoint[name]} != {getattr(model, name)}")
+        if "encoder_configs" in checkpoint:
+            expected = [enc.property_index for enc in model.solute_encs]
+            saved = [cfg["property_index"] for cfg in checkpoint["encoder_configs"]]
+            if saved != expected:
+                raise ValueError(f"Warm-start prior order mismatch: {saved} != {expected}")
+        state = _remap_state_dict_keys_for_mix_model(
+            checkpoint.get("model_state_dict", checkpoint))
+        transfers = []
+        for name in ("solute_fusion", "solvent_fusion"):
+            module = getattr(model, name)
+            prefix = name + "."
+            subset = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            expected = module.state_dict()
+            if set(subset) != set(expected) or any(
+                subset[k].shape != expected[k].shape for k in expected if k in subset
+            ):
+                raise ValueError(f"Incompatible {name} checkpoint; match fusion type, global features, and branch dimensions.")
+            transfers.append((module, subset))
+        for module, subset in transfers:
+            module.load_state_dict(subset, strict=True)
+        print(f"[Checkpoint] Loaded both fusion modules from {ckpt_path}")
 
-        model_state = model.state_dict()
-        loadable: Dict[str, torch.Tensor] = {}
-        skipped: List[str] = []
-        for key, value in state.items():
-            if key not in model_state:
-                skipped.append(f"{key} (not in model)")
-                continue
-            if tuple(model_state[key].shape) != tuple(value.shape):
-                skipped.append(f"{key} (shape {tuple(value.shape)} -> {tuple(model_state[key].shape)})")
-                continue
-            loadable[key] = value
-
-        missing, unexpected = model.load_state_dict(loadable, strict=False)
-        print(f"[Checkpoint] Loaded compatible weights from: {ckpt_path}")
-        print(f"[Checkpoint] loadable keys: {len(loadable)}")
-        print(f"[Checkpoint] missing keys: {len(missing)}")
-        print(f"[Checkpoint] unexpected keys: {len(unexpected)}")
-        if skipped:
-            print(f"[Checkpoint] skipped keys: {len(skipped)}")
-            for item in skipped[:20]:
-                print(f"  - {item}")
-            if len(skipped) > 20:
-                print(f"  ... {len(skipped) - 20} more skipped keys")
-
-    freeze_prefixes: List[str] = []
-    if freeze_encoders:
-        freeze_prefixes.extend(["solute_encs.", "solvent_encs."])
-    if freeze_fusions:
-        freeze_prefixes.extend(["solute_fusion.", "solvent_fusion."])
-    if freeze_combiner:
-        freeze_prefixes.append("combiner.")
-
-    frozen_count = 0
-    trainable_count = 0
-    for name, param in model.named_parameters():
-        if any(name.startswith(prefix) for prefix in freeze_prefixes):
-            param.requires_grad = False
-            frozen_count += param.numel()
-        else:
-            param.requires_grad = True
-            trainable_count += param.numel()
-
-    print(f"[Freeze] freeze_encoders={freeze_encoders}, freeze_fusions={freeze_fusions}, freeze_combiner={freeze_combiner}")
-    print(f"[Freeze] frozen parameters: {frozen_count:,}")
-    print(f"[Freeze] trainable parameters: {trainable_count:,}")
+    model.freeze_encoders = freeze_encoders
+    for group, frozen in ((model.solute_encs, freeze_encoders),
+                          (model.solvent_encs, freeze_encoders),
+                          (model.solute_fusion, freeze_fusions),
+                          (model.solvent_fusion, freeze_fusions),
+                          (model.combiner, freeze_combiner)):
+        for name, parameter in group.named_parameters():
+            parameter.requires_grad_(not frozen and not name.endswith("cached_zero_vector"))
+    model.train(model.training)
+    print(f"[Freeze] encoders={freeze_encoders}, fusions={freeze_fusions}, combiner={freeze_combiner}")
     return model
 
 
@@ -747,7 +682,7 @@ def load_checkpoint_into_mix_model(
 
 
 def evaluate_mix_model(
-    model: ChemSpaceAMixPredictor,
+    model: PRISMMixPredictor,
     loader: DataLoader,
     device: torch.device,
     save_predictions_path: Optional[str] = None,
@@ -858,7 +793,7 @@ def plot_scatter(labels: np.ndarray, preds: np.ndarray, out_path: str, title: st
 
 
 def train_mix_model(
-    model: ChemSpaceAMixPredictor,
+    model: PRISMMixPredictor,
     train_loader: DataLoader,
     val_loader: DataLoader,
     test_loader: DataLoader,
@@ -948,7 +883,11 @@ def train_mix_model(
     if save_best_ckpt:
         torch.save(
             {
+                "format_version": 2,
                 "model_state_dict": model.state_dict(),
+                "fusion_type": model.fusion_type,
+                "use_global_features": model.use_global_features,
+                "encoder_configs": [e.encoder_config() for e in model.solute_encs],
                 "best_val_mse": best_val,
                 "best_epoch": best_epoch,
             },
@@ -1027,6 +966,8 @@ def run_single_experiment(
     num_workers: int,
     split_file: Optional[str] = None,
     save_split: bool = True,
+    fusion_type: str = "adaptive",
+    use_global_features: bool = False,
 ) -> Dict[str, Any]:
     set_seed(seed)
     ensure_dir(out_dir)
@@ -1059,17 +1000,29 @@ def run_single_experiment(
         mlp_dropout=mlp_dropout,
         t_embed_dim=t_embed_dim,
         device=device,
+        fusion_type=fusion_type,
+        use_global_features=use_global_features,
     )
 
     model = load_checkpoint_into_mix_model(
         model=model,
-        ckpt_path=init_ckpt,
+        ckpt_path=init_ckpt.format(seed=seed) if init_ckpt else None,
         device=device,
         freeze_encoders=freeze_encoders,
         freeze_fusions=freeze_fusions,
         freeze_combiner=freeze_combiner,
     )
 
+    save_json({"encoder_ckpts": list(encoder_ckpts),
+               "init_ckpt": init_ckpt.format(seed=seed) if init_ckpt else None,
+               "fusion_type": fusion_type, "use_global_features": use_global_features,
+               "seed": seed, "epochs": epochs, "batch_size": batch_size,
+               "lr": lr, "weight_decay": weight_decay, "patience": patience,
+               "solute_dropout": solute_dropout, "solvent_dropout": solvent_dropout,
+               "mlp_hidden": list(mlp_hidden), "mlp_dropout": mlp_dropout,
+               "t_embed_dim": t_embed_dim, "freeze_encoders": freeze_encoders,
+               "freeze_fusions": freeze_fusions, "freeze_combiner": freeze_combiner},
+              os.path.join(out_dir, "config.json"))
     stats = train_mix_model(
         model=model,
         train_loader=train_loader,
@@ -1099,11 +1052,11 @@ def summarize_runs(rows: List[Dict[str, Any]], out_path: str) -> pd.DataFrame:
             df.groupby(group_cols)
             .agg(
                 rmse_mean=("test_rmse", "mean"),
-                rmse_std=("test_rmse", "std"),
-                rmse_var=("test_rmse", "var"),
+                rmse_std=("test_rmse", lambda x: x.std(ddof=0)),
+                rmse_var=("test_rmse", lambda x: x.var(ddof=0)),
                 pct_le1_mean=("test_pct_le1", "mean"),
-                pct_le1_std=("test_pct_le1", "std"),
-                pct_le1_var=("test_pct_le1", "var"),
+                pct_le1_std=("test_pct_le1", lambda x: x.std(ddof=0)),
+                pct_le1_var=("test_pct_le1", lambda x: x.var(ddof=0)),
                 n_runs=("test_rmse", "count"),
             )
             .reset_index()
@@ -1178,6 +1131,8 @@ def run_repeated_experiments(args: argparse.Namespace) -> pd.DataFrame:
                 freeze_fusions=args.freeze_fusions,
                 freeze_combiner=args.freeze_combiner,
                 num_workers=args.num_workers,
+                fusion_type=args.fusion_type,
+                use_global_features=args.use_global_features,
             )
             stats["experiment"] = args.experiment_name
             rows.append(stats)
@@ -1261,6 +1216,8 @@ def run_ablation(args: argparse.Namespace) -> pd.DataFrame:
                 freeze_fusions=args.freeze_fusions,
                 freeze_combiner=args.freeze_combiner,
                 num_workers=args.num_workers,
+                fusion_type=args.fusion_type,
+                use_global_features=args.use_global_features,
             )
             stats["experiment"] = f"subset_{subset}"
             stats["subset"] = subset
@@ -1278,7 +1235,7 @@ def run_ablation(args: argparse.Namespace) -> pd.DataFrame:
 
 
 def add_data_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--mix_csv", type=str, default="pair_data/mix_noaq.csv")
+    parser.add_argument("--mix_csv", type=str, default="data/pair_data/mix.csv")
     parser.add_argument("--solute_col", type=str, default="solute_smiles")
     parser.add_argument("--solvent1_col", type=str, default="solvent1_smiles")
     parser.add_argument("--solvent2_col", type=str, default="solvent2_smiles")
@@ -1293,8 +1250,10 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pretrain_base_dir", type=str, default="ckpt/tau_0.1__scale_0.25")
     parser.add_argument("--task_dirs", type=str, default="task_0,task_1,task_2,task_none")
     parser.add_argument("--encoder_ckpt_name", type=str, default="best_model.pth")
-    parser.add_argument("--init_ckpt", type=str, default="", help="Optional pure-solvent checkpoint for initialization.")
-    parser.add_argument("--emb_dim", type=int, default=512)
+    parser.add_argument("--init_ckpt", type=str, default="", help="Pure-solvent fusion checkpoint; {seed} is replaced for each run.")
+    parser.add_argument("--emb_dim", type=int, default=512, help="Legacy argument; actual width is read from checkpoints.")
+    parser.add_argument("--fusion_type", choices=["static", "adaptive"], default="adaptive")
+    parser.add_argument("--use_global_features", action="store_true", help="Opt in to molecular global features.")
     parser.add_argument("--solute_dropout", type=float, default=0.3)
     parser.add_argument("--solvent_dropout", type=float, default=0.3)
     parser.add_argument("--mlp_hidden", type=str, default="1024,128,64")
@@ -1311,7 +1270,7 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
 
-    # Updated-paper default: freeze PRISM/ChemSpaceA encoders, train only the
+    # Default: freeze PRISM encoders, train only the
     # lightweight mixed-solvent head/fusion unless flags are changed.
     parser.add_argument("--freeze_encoders", action="store_true", default=True)
     parser.add_argument("--unfreeze_encoders", dest="freeze_encoders", action="store_false")
@@ -1332,7 +1291,7 @@ def add_split_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ChemSpaceA/PRISM mixed-solvent fine-tuning.")
+    parser = argparse.ArgumentParser(description="PRISM mixed-solvent fine-tuning.")
     sub = parser.add_subparsers(dest="mode", required=True)
 
     run_parser = sub.add_parser("run", help="Run repeated mixed-solvent experiments.")
@@ -1342,7 +1301,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_split_args(run_parser)
     run_parser.add_argument("--num_runs", type=int, default=3)
     run_parser.add_argument("--out_root", type=str, default="results/mix_prism")
-    run_parser.add_argument("--experiment_name", type=str, default="ChemSpaceA-Mix")
+    run_parser.add_argument("--experiment_name", type=str, default="PRISM")
 
     ab_parser = sub.add_parser("ablation", help="Run branch-subset ablations.")
     add_data_args(ab_parser)

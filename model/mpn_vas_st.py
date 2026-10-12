@@ -1,25 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-ChemSpaceA / PRISM prior-alignment encoder.
+"""PRISM prior-alignment encoder.
 
-This module implements the model used for prior-alignment pre-training in the
-current ChemSpaceA framework.
-
-The training objective is a single population-level soft-neighborhood alignment
-loss:
-
-    prior distances  ->  soft prior neighborhoods
-    embedding cosine similarities -> soft embedding neighborhoods
-    loss = KL(prior neighborhood || embedding neighborhood)
-
-Supported prior spaces:
-    1. Descriptor prior spaces, e.g. SMR_VSA, SlogP_VSA, PEOE_VSA
-       stored as property_0, property_1, property_2, ...
-    2. Fingerprint prior space, using 1 - Tanimoto distance from SMILES.
-
-The module intentionally removes earlier experimental traces such as
-rank losses, distance-regression losses, and alternative loss-selection logic.
+KL alignment matches soft molecular neighborhoods within each mini-batch.
+The teacher uses VSA descriptor distances or fingerprint Tanimoto distances.
 """
 
 from argparse import Namespace
@@ -68,9 +52,9 @@ class FilterEmptyGraphs(torch.utils.data.Dataset):
         return self.filtered_dataset[idx]
 
 
-class ChemSpaceAPriorEncoder(nn.Module):
+class PRISMPriorEncoder(nn.Module):
     """
-    CMPNN-style molecular graph encoder for ChemSpaceA prior-alignment pre-training.
+    message-passing molecular graph encoder for PRISM prior-alignment pre-training.
 
     Parameters
     ----------
@@ -100,7 +84,7 @@ class ChemSpaceAPriorEncoder(nn.Module):
         self,
         num_node_features: int,
         num_edge_features: int,
-        num_global_features: int,
+        num_global_features: int = 0,
         cov_num: int = 3,
         hidden_dim: int = 256,
         dropout_rate: float = 0.3,
@@ -116,6 +100,7 @@ class ChemSpaceAPriorEncoder(nn.Module):
         tau_physical: Optional[float] = None,
         tau_phys_scale: float = 0.5,
         projection_dim: int = 64,
+        atom_messages: bool = True,
     ):
         super().__init__()
 
@@ -125,7 +110,9 @@ class ChemSpaceAPriorEncoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.dropout_rate = float(dropout_rate)
         self.batch_size = int(batch_size)
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.cov_num = int(cov_num)
+        self.projection_dim = int(projection_dim)
+        self.atom_messages = bool(atom_messages)
         self.property_index = self._normalize_property_index(property_index)
         self.save_path = save_path
 
@@ -141,7 +128,7 @@ class ChemSpaceAPriorEncoder(nn.Module):
 
         mpn_args = Namespace(
             hidden_size=self.hidden_dim,
-            atom_messages=True,
+            atom_messages=self.atom_messages,
             bias=True,
             depth=max(1, int(cov_num)),
             dropout=self.dropout_rate,
@@ -173,6 +160,25 @@ class ChemSpaceAPriorEncoder(nn.Module):
     # ------------------------------------------------------------------
     # Batch field helpers
     # ------------------------------------------------------------------
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def output_dim(self):
+        return self.hidden_dim + (32 if self.global_encoder is not None else 0)
+
+    def encoder_config(self):
+        """Serializable architecture and prior settings for strict reconstruction."""
+        names = (
+            "num_node_features", "num_edge_features", "num_global_features",
+            "cov_num", "hidden_dim", "dropout_rate", "batch_size",
+            "property_index", "fp_type", "fp_radius", "fp_nbits",
+            "fp_use_chirality", "tau", "tau_physical", "tau_phys_scale",
+            "projection_dim", "atom_messages",
+        )
+        return {name: getattr(self, name) for name in names}
+
     @staticmethod
     def _normalize_property_index(property_index):
         if property_index is None:
@@ -544,7 +550,7 @@ class ChemSpaceAPriorEncoder(nn.Module):
         standardize_props: bool = True,
     ) -> torch.Tensor:
         """
-        Compute the ChemSpaceA prior-alignment loss for a batch.
+        Compute the PRISM prior-alignment loss for a batch.
 
         If property_index is an integer, descriptor prior alignment is used.
         If property_index is None, fingerprint prior alignment is used.
@@ -587,4 +593,4 @@ class ChemSpaceAPriorEncoder(nn.Module):
             standardize=standardize_props,
         )
 
-GNNModelWithNewLoss = ChemSpaceAPriorEncoder
+GNNModelWithNewLoss = PRISMPriorEncoder
